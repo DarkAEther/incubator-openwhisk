@@ -2,10 +2,10 @@
 # license agreements; and to You under the Apache License, Version 2.0.
 
 mode: deploy
+lean: false
 prompt_user: true
 openwhisk_home: "{{ lookup('env', 'OPENWHISK_HOME') | default(playbook_dir ~ '/..', true) }}"
 openwhisk_cli_home: "{{ lookup('env', 'OPENWHISK_CLI') | default(openwhisk_home ~ '/../incubator-openwhisk-cli', true) }}"
-openwhisk_build_dir: "{{ openwhisk_home }}/build"
 exclude_logs_from: []
 
 # This whisk_api_localhost_name_default is used to configure nginx to permit vanity URLs for web actions
@@ -36,7 +36,7 @@ whisk:
     date: "{{ansible_date_time.iso8601}}"
 
 ##
-# configuration parameters related to support runtimes (see whisk.core.entity.ExecManifest for schema of the manifest).
+# configuration parameters related to support runtimes (see org.apache.openwhisk.core.entity.ExecManifest for schema of the manifest).
 # briefly the parameters are:
 #
 #   runtimes_registry: optional registry (with trailing slack) where to pull docker images from for runtimes and backbox images
@@ -48,14 +48,20 @@ whisk:
 #   runtimes_bypass_pull_for_local_images: optional, if true, allow images with a prefix that matches
 #       {{ runtimes_local_image_prefix }} to skip docker pull in invoker even if the image is not part of the blackbox set
 #
-runtimesManifest: "{{ runtimes_manifest | default(lookup('file', openwhisk_home ~ '/ansible/files/runtimes.json') | from_json) }}"
+
+manifestfile: "{{ manifest_file | default('/ansible/files/runtimes.json') }}"
+runtimesManifest: "{{ runtimes_manifest | default(lookup('file', openwhisk_home ~ '{{ manifestfile }}') | from_json) }}"
+skip_pull_runtimes: "false"
 
 limits:
   invocationsPerMinute: "{{ limit_invocations_per_minute | default(60) }}"
   concurrentInvocations: "{{ limit_invocations_concurrent | default(30) }}"
-  concurrentInvocationsSystem:  "{{ limit_invocations_concurrent_system | default(5000) }}"
   firesPerMinute: "{{ limit_fires_per_minute | default(60) }}"
   sequenceMaxLength: "{{ limit_sequence_max_length | default(50) }}"
+
+# Moved here to avoid recursions. Please do not use outside of controller-dict.
+__controller_ssl_keyPrefix: "controller-"
+__controller_blackbox_fraction: 0.10
 
 # port means outer port
 controller:
@@ -63,13 +69,14 @@ controller:
     become: "{{ controller_dir_become | default(false) }}"
   confdir: "{{ config_root_dir }}/controller"
   basePort: 10001
-  heap: "{{ controller_heap | default('2g') }}"
+  heap: "{{ controller_heap | default('1g') }}"
   arguments: "{{ controller_arguments | default('') }}"
-  blackboxFraction: "{{ controller_blackbox_fraction | default(0.10) }}"
+  managedFraction: "{{ controller_managed_fraction | default(1.0 - (controller_blackbox_fraction | default(__controller_blackbox_fraction))) }}"
+  blackboxFraction: "{{ controller_blackbox_fraction | default(__controller_blackbox_fraction) }}"
+  timeoutFactor: "{{ controller_timeout_factor | default(2) }}"
   instances: "{{ groups['controllers'] | length }}"
-  localBookkeeping: "{{ controller_local_bookkeeping | default('false') }}"
   akka:
-    provider: cluster
+    provider: local
     cluster:
       basePort: 8000
       host: "{{ groups['controllers'] | map('extract', hostvars, 'ansible_host') | list }}"
@@ -83,27 +90,18 @@ controller:
   loglevel: "{{ controller_loglevel | default(whisk_loglevel) | default('INFO') }}"
   entitlement:
     spi: "{{ controller_entitlement_spi | default('') }}"
-  protocol: "{{ controllerProtocolForSetup }}"
+  protocol: "{{ controller_protocol | default('https') }}"
   ssl:
     cn: openwhisk-controllers
-    cert: "{{ controller_ca_cert | default('controller-openwhisk-server-cert.pem') }}"
-    key: "{{ controller_key | default('controller-openwhisk-server-key.pem') }}"
-    clientAuth: "{{ controller_client_auth | default('true') }}"
+    keyPrefix: "{{ __controller_ssl_keyPrefix }}"
     storeFlavor: PKCS12
+    clientAuth: "{{ controller_client_auth | default('true') }}"
+    cert: "{{ __controller_ssl_keyPrefix }}openwhisk-server-cert.pem"
+    key: "{{ __controller_ssl_keyPrefix }}openwhisk-server-key.pem"
     keystore:
-      password: "{{ controllerKeystorePassword }}"
-      path: "/conf/{{ controllerKeystoreName }}"
-# keystore and truststore are the same as long as controller and nginx share the certificate
-    truststore:
-      password: "{{ controllerKeystorePassword }}"
-      path: "/conf/{{ controllerKeystoreName }}"
+      password: "openwhisk"
+      name: "{{ __controller_ssl_keyPrefix }}openwhisk-keystore.p12"
   extraEnv: "{{ controller_extraEnv | default({}) }}"
-
-# move controller protocol outside to not evaluate controller variables during execution of setup.yml
-controllerProtocolForSetup: "{{ controller_protocol | default('https') }}"
-controllerKeystoreName: "{{ controllerKeyPrefix }}openwhisk-keystore.p12"
-controllerKeyPrefix: "controller-"
-controllerKeystorePassword: openwhisk
 
 jmx:
   basePortController: 15000
@@ -112,7 +110,7 @@ jmx:
   rmiBasePortInvoker: 18000
   user: "{{ jmxuser | default('jmxuser') }}"
   pass: "{{ jmxuser | default('jmxpass') }}"
-  jvmCommonArgs: "-Dcom.sun.management.jmxremote -Dcom.sun.management.jmxremote.ssl=false -Dcom.sun.management.jmxremote.local.only=false -Dcom.sun.management.jmxremote.authenticate=true -Dcom.sun.management.jmxremote.password.file=/root/jmxremote.password -Dcom.sun.management.jmxremote.access.file=/root/jmxremote.access"
+  jvmCommonArgs: "-Dcom.sun.management.jmxremote -Dcom.sun.management.jmxremote.ssl=false -Dcom.sun.management.jmxremote.local.only=false -Dcom.sun.management.jmxremote.authenticate=true -Dcom.sun.management.jmxremote.password.file=/home/owuser/jmxremote.password -Dcom.sun.management.jmxremote.access.file=/home/owuser/jmxremote.access"
   enabled: "{{ jmxremote_enabled | default('true') }}"
 
 transactions:
@@ -141,6 +139,7 @@ kafka:
     port: 8093
   heap: "{{ kafka_heap | default('1g') }}"
   replicationFactor: "{{ kafka_replicationFactor | default((groups['kafkas']|length)|int) }}"
+  offsetsTopicReplicationFactor: "{{ kafka_offsetsTopicReplicationFactor | default(kafka_replicationFactor) | default((groups['kafkas']|length)|int) }}"
   # adapt this param for production deployments depending on the number of kafka consumers
   networkThreads: "{{ kafka_network_threads | default(3) }}"
 
@@ -165,6 +164,9 @@ zookeeper_connect_string: "{% set ret = [] %}\
 invokerHostnameFromMap: "{{ groups['invokers'] | map('extract', hostvars, 'ansible_host') | list | first }}"
 invokerHostname: "{{ invokerHostnameFromMap | default(inventory_hostname) }}"
 
+# Moved here to avoid recursions. Please do not use outside of invoker-dict.
+__invoker_ssl_keyPrefix: "invoker-"
+
 invoker:
   dir:
     become: "{{ invoker_dir_become | default(false) }}"
@@ -172,10 +174,7 @@ invoker:
   port: 12001
   heap: "{{ invoker_heap | default('2g') }}"
   arguments: "{{ invoker_arguments | default('') }}"
-  numcore: 2
-  coreshare: 2
-  busyThreshold: "{{ invoker_busy_threshold | default(16) }}"
-  instances: "{{ groups['invokers'] | length }}"
+  userMemory: "{{ invoker_user_memory | default('2048m') }}"
   # Specify if it is allowed to deploy more than 1 invoker on a single machine.
   allowMultipleInstances: "{{ invoker_allow_multiple_instances | default(false) }}"
   # Specify if it should use docker-runc or docker to pause/unpause containers
@@ -188,19 +187,30 @@ invoker:
     {{ jmx.jvmCommonArgs }} -Djava.rmi.server.hostname={{ invokerHostname }} -Dcom.sun.management.jmxremote.rmi.port={{ jmx.rmiBasePortInvoker + groups['invokers'].index(inventory_hostname) }} -Dcom.sun.management.jmxremote.port={{ jmx.basePortInvoker + groups['invokers'].index(inventory_hostname) }}
     {% endif %}"
   extraEnv: "{{ invoker_extraEnv | default({}) }}"
+  protocol: "{{ invoker_protocol | default('https') }}"
+  ssl:
+    cn: "openwhisk-invokers"
+    keyPrefix: "{{ __invoker_ssl_keyPrefix }}"
+    storeFlavor: "PKCS12"
+    clientAuth: "{{ invoker_client_auth | default('true') }}"
+    cert: "{{ __invoker_ssl_keyPrefix }}openwhisk-server-cert.pem"
+    key: "{{ __invoker_ssl_keyPrefix }}openwhisk-server-key.pem"
+    keystore:
+      password: "{{ invoker_keystore_password | default('openwhisk') }}"
+      name: "{{ __invoker_ssl_keyPrefix }}openwhisk-keystore.p12"
 
 userLogs:
-  spi: "{{ userLogs_spi | default('whisk.core.containerpool.logging.DockerToActivationLogStoreProvider') }}"
+  spi: "{{ userLogs_spi | default('org.apache.openwhisk.core.containerpool.logging.DockerToActivationLogStoreProvider') }}"
 
 nginx:
   confdir: "{{ config_root_dir }}/nginx"
+  htmldir: "{{ ui_path | default(false) }}"
   dir:
     become: "{{ nginx_dir_become | default(false) }}"
   version: "{{ nginx_version | default('1.13') }}"
   port:
     http: 80
     api: 443
-    adminportal: 8443
   ssl:
     path: "{{ openwhisk_home }}/ansible/roles/nginx/files"
     cert: "openwhisk-server-cert.pem"
@@ -223,8 +233,9 @@ nginx:
 db:
   provider: "{{ db_provider | default(lookup('ini', 'db_provider section=db_creds file={{ playbook_dir }}/db_local.ini')) }}"
   protocol: "{{ db_protocol | default(lookup('ini', 'db_protocol section=db_creds file={{ playbook_dir }}/db_local.ini')) }}"
-  port: "{{ dp_port | default(lookup('ini', 'db_port section=db_creds file={{ playbook_dir }}/db_local.ini')) }}"
+  port: "{{ db_port | default(lookup('ini', 'db_port section=db_creds file={{ playbook_dir }}/db_local.ini')) }}"
   host: "{{ db_host | default(lookup('ini', 'db_host section=db_creds file={{ playbook_dir }}/db_local.ini')) }}"
+  persist_path: "{{ db_persist_path | default(false) }}"
   instances: "{{ groups['db'] | length }}"
   authkeys:
   - guest
@@ -237,23 +248,32 @@ db:
     admin:
       user: "{{ db_username | default(lookup('ini', 'db_username section=db_creds file={{ playbook_dir }}/db_local.ini')) }}"
       pass: "{{ db_password | default(lookup('ini', 'db_password section=db_creds file={{ playbook_dir }}/db_local.ini')) }}"
+    controller:
+      user: "{{ db_controller_user | default(lookup('ini', 'db_username section=controller file={{ playbook_dir }}/db_local.ini')) }}"
+      pass: "{{ db_controller_pass | default(lookup('ini', 'db_password section=controller file={{ playbook_dir }}/db_local.ini')) }}"
+    invoker:
+      user: "{{ db_invoker_user | default(lookup('ini', 'db_username section=invoker file={{ playbook_dir }}/db_local.ini')) }}"
+      pass: "{{ db_invoker_pass | default(lookup('ini', 'db_password section=invoker file={{ playbook_dir }}/db_local.ini')) }}"
 
 apigateway:
   port:
     api: 9000
-    api_secure: 443
     mgmt: 9001
-  version: 0.9.10
+  # apigateway is an Apahce OpenWhisk project, so default to latest
+  version: latest
 
 redis:
-  version: 3.2
+  version: 4.0
   port: 6379
+  password: openwhisk
 
 linux:
   version: 4.4.0-31
 
 couchdb:
-  version: 2.1
+  docker_image: treehouses/couchdb
+  version: 2.1.0
+  pull_couchdb: true
 
 docker:
   # The user to install docker for. Defaults to the ansible user if not set. This will be the user who is able to run
@@ -270,15 +290,10 @@ docker:
   pull:
     retries: 10
     delay: 10
-
-sdk:
-  dir:
-    become: "{{ sdk_dir_become | default(false) }}"
+  timezone: "{{ docker_timezone | default('UTC') }}"
 
 cli:
   path: "{{ openwhisk_home }}/bin/wsk"
-  dir:
-    become: "{{ cli_dir_become | default(false) }}"
 
 # The default name space is /whisk.system. The catalog namespace must begin with a slash "/".
 catalog_namespace: "/whisk.system"
@@ -287,7 +302,7 @@ catalog_namespace: "/whisk.system"
 # The value for this variable can be set to either the secret key itself or the file, which
 # saves the secret key.
 # By default, we take the key from {{ openwhisk_home }}/ansible/files/auth.whisk.system.
-catalog_auth_key: "{{ openwhisk_home }}/ansible/files/auth.whisk.system"
+catalog_auth_key: "{{ playbook_dir }}/files/auth.whisk.system"
 
 # The catalog_repos is used to specify all the catalog names and repository URLs,
 # so that openwhisk knows where to download the catalog and install them. The key
@@ -311,7 +326,7 @@ catalog_auth_key: "{{ openwhisk_home }}/ansible/files/auth.whisk.system"
 #
 catalog_repos:
   openwhisk-catalog:
-    url: https://github.com/apache/incubator-openwhisk-catalog.git
+    url: https://github.com/apache/openwhisk-catalog.git
     # Set the local location as the same level as openwhisk home, but it can be changed.
     location: "{{ openwhisk_home }}/../openwhisk-catalog"
     version: "HEAD"
@@ -359,3 +374,5 @@ metrics:
     port: "{{ metrics_kamon_statsd_port | default('8125') }}"
 
 user_events: "{{ user_events_enabled | default(false) }}"
+
+
